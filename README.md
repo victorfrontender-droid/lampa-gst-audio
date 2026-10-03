@@ -62,4 +62,4 @@ Lampa.Storage.set('gst_audio_switch_debug', false)
 
 ## Версия
 
-`1.0.0`
+`1.0.3`
