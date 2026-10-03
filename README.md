@@ -16,28 +16,17 @@ TorrServer-gst отдаёт HLS с **одной** аудиодорожкой. Л
 
 ## Установка
 
-### 1. Запустите локальный сервер плагина
-
-Дважды кликните:
-
-`C:\Users\victor\Documents\lampa-gst-audio\start-server.bat`
-
-В консоли появится URL:
-
-```text
-http://127.0.0.1:8199/gst-audio-switch.js
-```
-
-Окно сервера лучше не закрывать (или закрепить автозапуск позже).
-
-### 2. Добавьте плагин в Лампу
-
 1. Откройте Лампу
 2. `Настройки → Расширения / Плагины → Добавить плагин`
-3. Вставьте: `http://127.0.0.1:8199/gst-audio-switch.js`
+3. Вставьте:
+
+```text
+https://cdn.jsdelivr.net/gh/victorfrontender-droid/lampa-gst-audio@main/gst-audio-switch.js
+```
+
 4. Перезапустите Лампу
 
-### 3. Проверка
+## Проверка
 
 1. Убедитесь, что в Лампе включено **транскодирование / GStreamer** для TorrServer
 2. Запустите серию через встроенный плеер
@@ -70,7 +59,6 @@ Lampa.Storage.set('gst_audio_switch_debug', false)
 ## Файлы
 
 - `gst-audio-switch.js` — сам плагин
-- `serve.ps1` / `start-server.bat` — локальная HTTP-раздача для установки в Лампу
 
 ## Версия
 
