@@ -2,49 +2,41 @@
     'use strict';
 
     /**
-     * GST Audio Switch for Lampa
-     * Реальная смена озвучки во встроенном плеере при TorrServer-gst (HLS).
-     *
-     * Проблема: Лампа всегда открывает /gst/.../master.m3u8?audio=0, а HLS содержит
-     * одну дорожку. Меню «Аудиодорожки» показывает метаданные, но звук не меняется.
-     *
-     * Решение: при выборе дорожки перезапускаем поток с нужным audio=N
-     * (как делает Лампа при смене качества) и возвращаемся на текущее время.
+     * GST Audio Switch for Lampa + TorrServer-gst
+     * Меняет озвучку перезапуском HLS с нужным audio=N.
      */
-
-    var VERSION = '1.0.0';
-    var NAME = 'GST Audio Switch';
-    var LOG_PREFIX = '[GST-Audio]';
-    var STORAGE_PREF = 'gst_audio_switch_pref';
-    var STORAGE_DEBUG = 'gst_audio_switch_debug';
+    var VERSION = '1.0.3';
+    var LOG = '[GST-Audio]';
+    var PREF_KEY = 'gst_audio_switch_pref';
+    var DEBUG_KEY = 'gst_audio_switch_debug';
 
     var state = {
         active: false,
         switching: false,
-        hash: '',
-        fileIndex: '',
-        baseUrl: '',
         audioIndex: 0,
         tracks: [],
-        applyTimer: null,
+        applyTimers: [],
         seekTimer: null,
-        lastNotyAt: 0
+        autoTimer: null,
+        unlockTimer: null,
+        lastNotyAt: 0,
+        switchToken: 0
     };
 
-    function debugEnabled() {
+    function debug() {
         try {
-            return Lampa.Storage.get(STORAGE_DEBUG, 'false') === true
-                || Lampa.Storage.get(STORAGE_DEBUG, 'false') === 'true';
+            var v = Lampa.Storage.get(DEBUG_KEY, false);
+            return v === true || v === 'true';
         } catch (e) {
             return false;
         }
     }
 
     function log() {
-        if (!debugEnabled()) return;
+        if (!debug()) return;
         try {
             var args = Array.prototype.slice.call(arguments);
-            args.unshift(LOG_PREFIX);
+            args.unshift(LOG);
             console.log.apply(console, args);
         } catch (e) {}
     }
@@ -58,82 +50,94 @@
         } catch (e) {}
     }
 
-    function safe(label, fn) {
+    function safe(fn) {
         return function () {
             try {
                 return fn.apply(this, arguments);
             } catch (e) {
-                log('error in ' + label, e && e.message ? e.message : e);
+                log('error', e && e.message ? e.message : e);
             }
         };
+    }
+
+    function clearTimer(name) {
+        if (state[name]) {
+            clearTimeout(state[name]);
+            state[name] = null;
+        }
+    }
+
+    function clearApplyTimers() {
+        state.applyTimers.forEach(clearTimeout);
+        state.applyTimers = [];
     }
 
     function isGstUrl(url) {
         return typeof url === 'string' && /\/gst\/[^/]+\/master\.m3u8/i.test(url);
     }
 
-    function parseGstUrl(url) {
-        if (!isGstUrl(url)) return null;
-
-        var match = url.match(/^(https?:\/\/[^/]+)\/gst\/([^/?#]+)\/master\.m3u8\?(.*)$/i);
-        if (!match) return null;
-
+    function parseQuery(qs) {
         var query = {};
-        String(match[3] || '').split('&').forEach(function (part) {
+        String(qs || '').split('&').forEach(function (part) {
             if (!part) return;
             var kv = part.split('=');
             var key = decodeURIComponent(kv[0] || '');
-            var val = decodeURIComponent(kv.slice(1).join('=') || '');
-            if (key) query[key] = val;
+            if (!key) return;
+            query[key] = decodeURIComponent(kv.slice(1).join('=') || '');
         });
+        return query;
+    }
 
-        var fileIndex = query.index || query.id || query.fileID || '';
+    function parseGstUrl(url) {
+        var match = String(url || '').match(/^(https?:\/\/[^/]+)\/gst\/([^/?#]+)\/master\.m3u8\?(.*)$/i);
+        if (!match) return null;
+
+        var query = parseQuery(match[3]);
         var audio = parseInt(query.audio, 10);
-        if (isNaN(audio) || audio < 0) audio = 0;
 
         return {
             origin: match[1],
             hash: decodeURIComponent(match[2]),
-            fileIndex: String(fileIndex),
-            audio: audio,
-            query: query,
-            url: url
+            fileIndex: String(query.index || query.id || query.fileID || ''),
+            fileKey: query.index !== undefined ? 'index'
+                : query.id !== undefined ? 'id'
+                : query.fileID !== undefined ? 'fileID'
+                : 'index',
+            audio: isNaN(audio) || audio < 0 ? 0 : audio
         };
     }
 
     function buildGstUrl(parsed, audioIndex, seconds) {
-        var params = [];
-        var fileKey = parsed.query.index !== undefined ? 'index'
-            : parsed.query.id !== undefined ? 'id'
-            : parsed.query.fileID !== undefined ? 'fileID'
-            : 'index';
-
-        params.push(encodeURIComponent(fileKey) + '=' + encodeURIComponent(parsed.fileIndex));
-        params.push('audio=' + encodeURIComponent(String(audioIndex)));
+        var params = [
+            encodeURIComponent(parsed.fileKey) + '=' + encodeURIComponent(parsed.fileIndex),
+            'audio=' + encodeURIComponent(String(audioIndex))
+        ];
 
         if (typeof seconds === 'number' && isFinite(seconds) && seconds > 1) {
-            params.push('seconds=' + encodeURIComponent(String(Math.floor(seconds))));
+            params.push('seconds=' + Math.floor(seconds));
         }
 
         return parsed.origin + '/gst/' + encodeURIComponent(parsed.hash) + '/master.m3u8?' + params.join('&');
     }
 
-    function getPlaydata() {
+    function playdata() {
         try {
-            if (Lampa.Player && typeof Lampa.Player.playdata === 'function') {
-                return Lampa.Player.playdata() || null;
-            }
-        } catch (e) {}
-        return null;
+            return Lampa.Player && typeof Lampa.Player.playdata === 'function'
+                ? (Lampa.Player.playdata() || null)
+                : null;
+        } catch (e) {
+            return null;
+        }
     }
 
-    function getVideo() {
+    function videoEl() {
         try {
-            if (Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function') {
-                return Lampa.PlayerVideo.video();
-            }
-        } catch (e) {}
-        return null;
+            return Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function'
+                ? Lampa.PlayerVideo.video()
+                : null;
+        } catch (e) {
+            return null;
+        }
     }
 
     function toPlayUrl(url) {
@@ -146,21 +150,15 @@
     }
 
     function currentPosition() {
-        var video = getVideo();
-        var work = getPlaydata();
-        var time = 0;
-        var duration = 0;
+        var video = videoEl();
+        var work = playdata();
+        var time = video && isFinite(video.currentTime) ? video.currentTime : 0;
+        var duration = video && isFinite(video.duration) ? video.duration : 0;
 
-        if (video) {
-            if (isFinite(video.currentTime)) time = video.currentTime;
-            if (isFinite(video.duration)) duration = video.duration;
-        }
-
-        if ((!time || time < 1) && work && work.timeline && isFinite(work.timeline.time)) {
+        if (time < 1 && work && work.timeline && isFinite(work.timeline.time)) {
             time = work.timeline.time;
         }
-
-        if ((!duration || duration < 1) && work && work.timeline && isFinite(work.timeline.duration)) {
+        if (duration < 1 && work && work.timeline && isFinite(work.timeline.duration)) {
             duration = work.timeline.duration;
         }
 
@@ -170,35 +168,31 @@
         };
     }
 
-    function updateTimeline(time, duration) {
-        var work = getPlaydata();
+    function touchTimeline(time, duration, continued) {
+        var work = playdata();
         if (!work) return;
 
         if (!work.timeline || typeof work.timeline !== 'object') {
-            work.timeline = {
-                percent: 0,
-                time: 0,
-                duration: 0
-            };
+            work.timeline = { percent: 0, time: 0, duration: 0 };
         }
 
-        work.timeline.time = Math.max(0, time || 0);
-        if (duration > 0) {
-            work.timeline.duration = duration;
-            work.timeline.percent = Math.max(0, Math.min(99, Math.round((time / duration) * 100)));
-        } else if (work.timeline.duration > 0) {
-            work.timeline.percent = Math.max(0, Math.min(99, Math.round((time / work.timeline.duration) * 100)));
+        if (typeof time === 'number') {
+            work.timeline.time = Math.max(0, time);
+            var total = duration > 0 ? duration : work.timeline.duration;
+            if (total > 0) {
+                work.timeline.duration = total;
+                work.timeline.percent = Math.max(0, Math.min(99, Math.round((work.timeline.time / total) * 100)));
+            }
         }
 
-        // Как при смене качества: сбрасываем флаг продолжения, чтобы плеер сам seek-нул.
-        work.timeline.continued = false;
-        work.timeline.continued_bloc = false;
+        work.timeline.continued = !!continued;
+        work.timeline.continued_bloc = !!continued;
         work.timeline.waiting_for_user = false;
     }
 
-    function loadPrefs() {
+    function loadPref() {
         try {
-            var pref = Lampa.Storage.get(STORAGE_PREF, {});
+            var pref = Lampa.Storage.get(PREF_KEY, {});
             return pref && typeof pref === 'object' ? pref : {};
         } catch (e) {
             return {};
@@ -206,67 +200,54 @@
     }
 
     function savePref(track) {
-        if (!track) return;
+        if (!track || !track.label) return;
         try {
-            Lampa.Storage.set(STORAGE_PREF, {
+            Lampa.Storage.set(PREF_KEY, {
+                label: track.label,
                 language: (track.language || '').toLowerCase(),
-                label: track.label || '',
                 updated: Date.now()
             });
         } catch (e) {}
     }
 
-    function scoreTrack(track, pref) {
-        if (!pref) return 0;
-        var score = 0;
-        var lang = (track.language || '').toLowerCase();
-        var label = (track.label || '').toLowerCase();
-        var prefLang = (pref.language || '').toLowerCase();
-        var prefLabel = (pref.label || '').toLowerCase();
+    function pickPreferredTrack(tracks) {
+        var pref = loadPref();
+        var want = (pref.label || '').toLowerCase();
+        if (!want || !tracks || !tracks.length) return null;
 
-        if (prefLabel && label && label === prefLabel) score += 100;
-        else if (prefLabel && label && label.indexOf(prefLabel) >= 0) score += 60;
-        else if (prefLabel && label && prefLabel.indexOf(label) >= 0) score += 40;
+        var exact = null;
+        var partial = null;
 
-        if (prefLang && lang && lang === prefLang) score += 20;
-
-        return score;
-    }
-
-    function pickPreferredIndex(tracks) {
-        var pref = loadPrefs();
-        if (!tracks || !tracks.length || !pref || (!pref.label && !pref.language)) return 0;
-
-        var best = 0;
-        var bestScore = 0;
-
-        tracks.forEach(function (track, i) {
-            var score = scoreTrack(track, pref);
-            if (score > bestScore) {
-                bestScore = score;
-                best = i;
+        for (var i = 0; i < tracks.length; i++) {
+            var label = (tracks[i].label || '').toLowerCase();
+            if (!label) continue;
+            if (label === want) {
+                exact = tracks[i];
+                break;
             }
-        });
+            if (!partial && (label.indexOf(want) >= 0 || want.indexOf(label) >= 0)) {
+                partial = tracks[i];
+            }
+        }
 
-        return bestScore >= 20 ? best : 0;
+        return exact || partial;
     }
 
     function codecShort(capsName, codec) {
         var src = String(capsName || codec || '').toLowerCase();
         if (src.indexOf('eac3') >= 0 || src.indexOf('e-ac3') >= 0) return 'E-AC3';
         if (src.indexOf('ac3') >= 0) return 'AC3';
-        if (src.indexOf('aac') >= 0 || src.indexOf('mpeg') >= 0) return 'AAC';
+        if (src.indexOf('mp4a') >= 0 || src.indexOf('aac') >= 0) return 'AAC';
+        if (src.indexOf('mp3') >= 0) return 'MP3';
         if (src.indexOf('dts') >= 0) return 'DTS';
         if (src.indexOf('truehd') >= 0) return 'TrueHD';
         if (src.indexOf('opus') >= 0) return 'Opus';
-        if (src.indexOf('vorbis') >= 0) return 'Vorbis';
         return '';
     }
 
     function channelsLabel(channels) {
         var n = parseInt(channels, 10);
         if (!n || n < 1) return '';
-        if (n === 1) return '1.0';
         if (n === 2) return '2.0';
         if (n === 6) return '5.1';
         if (n === 8) return '7.1';
@@ -275,6 +256,7 @@
 
     function normalizeAudioTracks(probeTracks) {
         var list = [];
+
         (probeTracks || []).forEach(function (track) {
             if (!track || String(track.Type || '').toLowerCase() !== 'audio') return;
 
@@ -286,9 +268,7 @@
                 language: track.Language || '',
                 label: track.Title || '',
                 channels: track.Channels || 0,
-                rate: track.Rate || 0,
-                codec: codecShort(track.CapsName, track.Codec),
-                padName: track.PadName || ''
+                codec: codecShort(track.CapsName, track.Codec)
             });
         });
 
@@ -303,8 +283,7 @@
         log('probe', url);
 
         function done(json) {
-            if (json && json.Tracks) callback(null, json);
-            else callback(new Error('probe failed'));
+            callback(json && json.Tracks ? null : new Error('probe failed'), json);
         }
 
         function tryNative() {
@@ -326,83 +305,113 @@
         net.silent(url, function (json) {
             if (json && json.Tracks) done(json);
             else tryNative();
-        }, function () {
-            tryNative();
-        });
+        }, tryNative);
     }
 
-    function makePanelTrack(meta, selected) {
-        return {
+    function selectOpened() {
+        try {
+            return !!(Lampa.Select && typeof Lampa.Select.opened === 'function' && Lampa.Select.opened());
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function restorePlayerController() {
+        try {
+            if (selectOpened()) {
+                if (typeof Lampa.Select.close === 'function') Lampa.Select.close();
+                else if (typeof Lampa.Select.hide === 'function') Lampa.Select.hide();
+            }
+        } catch (e) {}
+
+        try {
+            if (!Lampa.Controller || typeof Lampa.Controller.toggle !== 'function') return;
+            var name = '';
+            try { name = Lampa.Controller.enabled().name; } catch (e2) {}
+            if (name === 'select' || name === 'player_panel' || name === 'player_rewind' || !name) {
+                Lampa.Controller.toggle('player');
+            }
+        } catch (e) {}
+    }
+
+    function makePanelTrack(meta) {
+        var track = {
             index: meta.index,
-            language: meta.language || 'und',
+            language: meta.language || '',
             label: meta.label || '',
-            selected: !!selected,
-            enabled: !!selected,
-            ghost: false,
+            selected: meta.index === state.audioIndex,
             extra: {
                 channels: channelsLabel(meta.channels),
                 fourCC: meta.codec || ''
-            },
-            // Панель плеера вызывает onSelect после выбора пункта меню.
-            onSelect: safe('onSelect', function () {
-                switchToAudio(meta.index, meta);
-            })
+            }
         };
+
+        // Без element.onSelect: иначе Select не вернёт Controller и сломается «Назад».
+        Object.defineProperty(track, 'enabled', {
+            configurable: true,
+            enumerable: true,
+            get: function () {
+                return state.audioIndex === meta.index;
+            },
+            set: function (value) {
+                if (value) switchToAudio(meta.index, meta);
+            }
+        });
+
+        return track;
     }
 
     function applyTracksToPanel(force) {
         if (!state.active || !state.tracks.length) return;
         if (state.switching && !force) return;
-
-        var panelTracks = state.tracks.map(function (meta) {
-            return makePanelTrack(meta, meta.index === state.audioIndex);
-        });
+        if (selectOpened()) return;
 
         if (Lampa.PlayerPanel && typeof Lampa.PlayerPanel.setTracks === 'function') {
-            Lampa.PlayerPanel.setTracks(panelTracks);
-            log('tracks applied', panelTracks.length, 'selected', state.audioIndex);
+            Lampa.PlayerPanel.setTracks(state.tracks.map(makePanelTrack));
+            log('tracks applied', state.tracks.length, 'selected', state.audioIndex);
         }
     }
 
     function scheduleApplyTracks() {
-        clearTimeout(state.applyTimer);
-        // Перебиваем Tracks/MediaInfo, которые подменяют список чуть позже.
-        var delays = [0, 250, 800, 1800, 3500];
-        delays.forEach(function (ms, i) {
-            setTimeout(safe('delayedApply#' + i, function () {
+        clearApplyTimers();
+        // Tracks/MediaInfo могут перетереть список чуть позже.
+        [0, 500, 2000].forEach(function (ms) {
+            state.applyTimers.push(setTimeout(safe(function () {
                 if (state.active) applyTracksToPanel(false);
-            }), ms);
+            }), ms));
         });
     }
 
-    function seekAfterReady(targetTime) {
-        clearTimeout(state.seekTimer);
-        if (!targetTime || targetTime < 3) return;
+    function finishSwitch(token) {
+        if (token !== state.switchToken) return;
+        clearTimer('unlockTimer');
+        state.switching = false;
+        restorePlayerController();
+        scheduleApplyTracks();
+    }
+
+    function seekAfterReady(targetTime, token) {
+        clearTimer('seekTimer');
+        if (!targetTime || targetTime < 3) {
+            touchTimeline(null, null, true);
+            return;
+        }
 
         var attempts = 0;
-        var maxAttempts = 40;
 
         function trySeek() {
+            if (token !== state.switchToken || !state.active) return;
+
             attempts += 1;
-            var video = getVideo();
-            if (!video) {
-                if (attempts < maxAttempts) state.seekTimer = setTimeout(trySeek, 250);
-                return;
-            }
-
-            var duration = video.duration || 0;
-            var ready = video.readyState >= 1 || (duration && isFinite(duration));
-
-            if (!ready) {
-                if (attempts < maxAttempts) state.seekTimer = setTimeout(trySeek, 250);
+            var video = videoEl();
+            if (!video || !(video.readyState >= 1 || (video.duration && isFinite(video.duration)))) {
+                if (attempts < 40) state.seekTimer = setTimeout(trySeek, 250);
                 return;
             }
 
             var posit = targetTime;
-            if (duration > 20) {
-                var maxPos = duration - 15;
-                if (posit > maxPos) posit = maxPos;
-            }
+            var duration = video.duration || 0;
+            if (duration > 20 && posit > duration - 15) posit = duration - 15;
 
             try {
                 if (Lampa.PlayerVideo && typeof Lampa.PlayerVideo.to === 'function') {
@@ -410,13 +419,50 @@
                 } else {
                     video.currentTime = posit;
                 }
-                log('seek to', posit);
+                touchTimeline(posit, duration, true);
+                log('seek', posit);
             } catch (e) {
                 log('seek failed', e && e.message);
             }
         }
 
         state.seekTimer = setTimeout(trySeek, 400);
+    }
+
+    function isUiBusy() {
+        if (selectOpened()) return true;
+
+        try {
+            var work = playdata();
+            if (work && work.timeline && work.timeline.waiting_for_user) return true;
+        } catch (e) {}
+
+        try {
+            var name = Lampa.Controller && Lampa.Controller.enabled
+                ? Lampa.Controller.enabled().name
+                : '';
+            if (name === 'select') return true;
+        } catch (e2) {}
+
+        return false;
+    }
+
+    function patchPlaylistAudio(work, audioIndex) {
+        if (!work || !work.playlist || !work.playlist.length) return;
+
+        work.playlist.forEach(function (item) {
+            if (!item || !isGstUrl(item.url)) return;
+            var parsed = parseGstUrl(item.url);
+            if (!parsed) return;
+            item.url = buildGstUrl(parsed, audioIndex);
+        });
+    }
+
+    function findTrack(audioIndex) {
+        for (var i = 0; i < state.tracks.length; i++) {
+            if (state.tracks[i].index === audioIndex) return state.tracks[i];
+        }
+        return null;
     }
 
     function switchToAudio(audioIndex, meta) {
@@ -429,151 +475,131 @@
             return;
         }
 
-        var work = getPlaydata();
-        if (!work || !isGstUrl(work.url)) {
-            notify('GST Audio: поток не gst/HLS');
-            return;
-        }
+        var work = playdata();
+        if (!work || !isGstUrl(work.url)) return;
 
         var parsed = parseGstUrl(work.url);
-        if (!parsed) {
-            notify('GST Audio: не удалось разобрать URL');
-            return;
-        }
+        if (!parsed) return;
 
         var pos = currentPosition();
         var nextUrl = buildGstUrl(parsed, audioIndex, pos.time);
+        var token = ++state.switchToken;
+        var track = meta || findTrack(audioIndex);
 
-        log('switch', state.audioIndex, '->', audioIndex, 'at', pos.time, nextUrl);
+        log('switch', state.audioIndex, '->', audioIndex, 'at', pos.time);
 
         state.switching = true;
         state.audioIndex = audioIndex;
-        savePref(meta || state.tracks.filter(function (t) { return t.index === audioIndex; })[0]);
+        savePref(track);
+        touchTimeline(pos.time, pos.duration, true);
 
-        updateTimeline(pos.time, pos.duration);
         work.url = nextUrl;
         work.gst_audio = audioIndex;
+        patchPlaylistAudio(work, audioIndex);
 
-        var label = (meta && (meta.label || meta.language)) || ('#' + (audioIndex + 1));
-        notify('Озвучка: ' + label);
+        notify('Озвучка: ' + ((track && (track.label || track.language)) || ('#' + (audioIndex + 1))));
+        restorePlayerController();
 
         try {
             if (Lampa.PlayerVideo && typeof Lampa.PlayerVideo.destroy === 'function') {
                 Lampa.PlayerVideo.destroy(true);
             }
-            if (Lampa.PlayerVideo && typeof Lampa.PlayerVideo.url === 'function') {
-                Lampa.PlayerVideo.url(toPlayUrl(nextUrl), true);
-            } else {
+            if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.url !== 'function') {
                 throw new Error('PlayerVideo.url unavailable');
             }
+            Lampa.PlayerVideo.url(toPlayUrl(nextUrl), true);
         } catch (e) {
             state.switching = false;
+            restorePlayerController();
             log('switch failed', e && e.message);
-            notify('GST Audio: ошибка переключения');
             return;
         }
 
         applyTracksToPanel(true);
-        seekAfterReady(pos.time);
+        seekAfterReady(pos.time, token);
 
-        setTimeout(safe('unlockSwitch', function () {
-            state.switching = false;
-            scheduleApplyTracks();
-        }), 1200);
+        clearTimer('unlockTimer');
+        state.unlockTimer = setTimeout(safe(function () {
+            finishSwitch(token);
+        }), 8000);
     }
 
     function maybeAutoselect(parsed) {
-        if (!state.tracks.length) return;
+        var track = pickPreferredTrack(state.tracks);
+        if (!track) return;
 
-        var preferred = pickPreferredIndex(state.tracks);
-        if (preferred === state.audioIndex) return;
-        if (preferred === parsed.audio) {
-            state.audioIndex = preferred;
+        if (track.index === state.audioIndex || track.index === parsed.audio) {
+            state.audioIndex = track.index;
             return;
         }
 
-        // Автовыбор только если пользователь уже сохранял предпочтение.
-        var pref = loadPrefs();
-        if (!pref || (!pref.label && !pref.language)) return;
+        clearTimer('autoTimer');
 
-        var track = state.tracks[preferred];
-        if (!track) return;
+        var attempts = 0;
+        function tryAuto() {
+            attempts += 1;
+            if (!state.active || state.switching) return;
 
-        log('autoselect', preferred, track.label || track.language);
-        setTimeout(safe('autoselect', function () {
-            if (state.active && !state.switching) switchToAudio(track.index, track);
-        }), 600);
+            if (isUiBusy() || attempts < 3) {
+                if (attempts < 40) state.autoTimer = setTimeout(tryAuto, attempts < 3 ? 400 : 500);
+                return;
+            }
+
+            switchToAudio(track.index, track);
+        }
+
+        state.autoTimer = setTimeout(tryAuto, 1200);
     }
 
     function resetState() {
-        clearTimeout(state.applyTimer);
-        clearTimeout(state.seekTimer);
+        clearApplyTimers();
+        clearTimer('seekTimer');
+        clearTimer('autoTimer');
+        clearTimer('unlockTimer');
         state.active = false;
         state.switching = false;
-        state.hash = '';
-        state.fileIndex = '';
-        state.baseUrl = '';
         state.audioIndex = 0;
         state.tracks = [];
+        state.switchToken += 1;
     }
 
     function onPlayerStart(data) {
         resetState();
 
-        if (!data || !isGstUrl(data.url)) {
-            log('skip: not gst url');
-            return;
-        }
+        if (!data || !isGstUrl(data.url)) return;
 
         var parsed = parseGstUrl(data.url);
-        if (!parsed || !parsed.hash || !parsed.fileIndex) {
-            log('skip: bad gst url', data.url);
-            return;
-        }
+        if (!parsed || !parsed.hash || !parsed.fileIndex) return;
 
         state.active = true;
-        state.hash = parsed.hash;
-        state.fileIndex = parsed.fileIndex;
-        state.baseUrl = parsed.origin;
         state.audioIndex = parsed.audio;
+        log('start', parsed.hash, parsed.fileIndex, 'audio', parsed.audio);
 
-        log('start', parsed.hash, 'file', parsed.fileIndex, 'audio', parsed.audio);
-
-        requestProbe(parsed, safe('probeCallback', function (err, json) {
+        requestProbe(parsed, safe(function (err, json) {
             if (!state.active) return;
 
             if (err || !json || !json.Tracks) {
                 log('probe error', err && err.message);
-                notify('GST Audio: не удалось получить дорожки');
                 return;
             }
 
             state.tracks = normalizeAudioTracks(json.Tracks);
-            if (state.tracks.length < 2) {
-                log('only one audio track, nothing to switch');
-                if (state.tracks.length === 1) applyTracksToPanel(true);
-                return;
-            }
+            if (!state.tracks.length) return;
 
             applyTracksToPanel(true);
-            scheduleApplyTracks();
-            maybeAutoselect(parsed);
+            if (state.tracks.length > 1) {
+                scheduleApplyTracks();
+                maybeAutoselect(parsed);
+            }
         }));
     }
 
-    function onPlayerDestroy() {
-        log('destroy');
-        resetState();
-    }
-
-    function onVideoTracks() {
-        if (!state.active || state.switching) return;
-        // HLS обычно отдаёт 1 дорожку — возвращаем полный список из probe.
-        scheduleApplyTracks();
-    }
-
     function onCanPlay() {
-        if (!state.active || state.switching) return;
+        if (!state.active) return;
+        if (state.switching) {
+            finishSwitch(state.switchToken);
+            return;
+        }
         scheduleApplyTracks();
     }
 
@@ -583,19 +609,18 @@
             return;
         }
 
-        Lampa.Player.listener.follow('start', safe('start', onPlayerStart));
-        Lampa.Player.listener.follow('destroy', safe('destroy', onPlayerDestroy));
-        Lampa.Player.listener.follow('ready', safe('ready', function () {
-            if (state.active) scheduleApplyTracks();
-        }));
+        Lampa.Player.listener.follow('start', safe(onPlayerStart));
+        Lampa.Player.listener.follow('destroy', safe(resetState));
 
         if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener) {
-            Lampa.PlayerVideo.listener.follow('tracks', safe('tracks', onVideoTracks));
-            Lampa.PlayerVideo.listener.follow('canplay', safe('canplay', onCanPlay));
+            Lampa.PlayerVideo.listener.follow('tracks', safe(function () {
+                if (state.active && !state.switching) scheduleApplyTracks();
+            }));
+            Lampa.PlayerVideo.listener.follow('canplay', safe(onCanPlay));
         }
 
         try {
-            console.log(LOG_PREFIX, 'loaded v' + VERSION);
+            console.log(LOG, 'v' + VERSION);
         } catch (e) {}
     }
 
